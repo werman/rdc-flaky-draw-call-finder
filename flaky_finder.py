@@ -73,51 +73,70 @@ def get_output_hashes_of_eid(controller, event_id):
     depth_targets = [pipeline_state.GetDepthTarget()]
 
     for bound_resource in (color_targets + depth_targets):
-        if bound_resource.resourceId == rd.ResourceId.Null():
+        if bound_resource.resource == rd.ResourceId.Null():
             continue
 
         # TODO: Should we check all slices and mips starting from firstMip and firstSlice?
 
         subresource = rd.Subresource(bound_resource.firstMip, bound_resource.firstSlice, 0)
-        data = controller.GetTextureData(bound_resource.resourceId, subresource)
+        data = controller.GetTextureData(bound_resource.resource, subresource)
 
         sha1 = hashlib.sha1()
         sha1.update(data)
 
         subresource_desc = SubresourceDesc(bound_resource.firstMip, bound_resource.firstSlice)
-        resource_hashes[ResourceKey(bound_resource.resourceId, subresource_desc)] = sha1.hexdigest()
+        resource_hashes[ResourceKey(bound_resource.resource, subresource_desc)] = sha1.hexdigest()
 
     for stage in range(rd.ShaderStage.Count):
         rw_resources = pipeline_state.GetReadWriteResources(stage)
-        for rw_resource_array in rw_resources:
-            for bound_rw_resource in rw_resource_array.resources:
-                if bound_rw_resource.resourceId == rd.ResourceId.Null():
-                    continue
+        for rw_descriptor in rw_resources:
+            if rw_descriptor.descriptor.resource == rd.ResourceId.Null():
+                continue
 
-                data = controller.GetBufferData(bound_rw_resource.resourceId, 0, 0)
+            data = controller.GetBufferData(rw_descriptor.descriptor.resource, 0, 0)
 
-                sha1 = hashlib.sha1()
-                sha1.update(data)
+            sha1 = hashlib.sha1()
+            sha1.update(data)
 
-                subresource_desc = SubresourceDesc(0, 0)
-                resource_hashes[ResourceKey(bound_rw_resource.resourceId, subresource_desc)] = sha1.hexdigest()
+            subresource_desc = SubresourceDesc(0, 0)
+            resource_hashes[ResourceKey(rw_descriptor.descriptor.resource, subresource_desc)] = sha1.hexdigest()
 
     return resource_hashes
 
 
 def check_for_discrepancy(controller):
-    draw_calls = controller.GetDrawcalls()
-    for idx, call in enumerate(draw_calls):
-        print_progress_bar(idx, len(draw_calls), prefix="Draw Calls:", suffix="Checked")
+    action = controller.GetRootActions()[0]
+    while len(action.children) > 0:
+        action = action.children[0]
 
-        resource_hashes_a = get_output_hashes_of_eid(controller, call.eventId)
-        resource_hashes_b = get_output_hashes_of_eid(controller, call.eventId)
+    first_action = action
+
+    total_draw_calls = 0
+    while action is not None:
+        if action.flags & rd.ActionFlags.Drawcall or action.flags & rd.ActionFlags.Dispatch:
+            total_draw_calls += 1
+        action = action.next
+
+    action = first_action
+    draw_idx = 0
+    while action is not None:
+        if not (action.flags & rd.ActionFlags.Drawcall or action.flags & rd.ActionFlags.Dispatch):
+            action = action.next
+            continue
+
+        resource_hashes_a = get_output_hashes_of_eid(controller, action.eventId)
+        resource_hashes_b = get_output_hashes_of_eid(controller, action.eventId)
 
         for key in resource_hashes_a:
             if resource_hashes_a[key] != resource_hashes_b[key]:
                 finish_progress_bar()
-                print(f"Found discrepancy in EID {call.eventId}, resource {key.rId}")
+                print(f"Found discrepancy in EID {action.eventId}, resource {key.rId}")
                 return
+
+        draw_idx += 1
+        print_progress_bar(draw_idx, total_draw_calls, prefix="Draw Calls:",
+                           suffix=f"Checked ({action.GetName(controller.GetStructuredFile())})")
+        action = action.next
 
     finish_progress_bar()
     print(f"No discrepancies found!")
@@ -126,7 +145,7 @@ def check_for_discrepancy(controller):
 def get_remote_controller(host: str, rdc_path: str):
     status, remote = rd.CreateRemoteServerConnection(host)
 
-    if status != rd.ReplayStatus.Succeeded:
+    if status != rd.ResultCode.Succeeded:
         raise RuntimeError(f"Couldn't connect to remote server, got error {str(status)}")
 
     remote_rdc_path = remote.CopyCaptureToRemote(rdc_path,
@@ -134,9 +153,11 @@ def get_remote_controller(host: str, rdc_path: str):
                                                                                      "Transferring capture:"))
     finish_progress_bar()
 
-    status, controller = remote.OpenCapture(rd.RemoteServer.NoPreference, remote_rdc_path, rd.ReplayOptions(), None)
+    status, controller = remote.OpenCapture(rd.RemoteServer.NoPreference, remote_rdc_path, rd.ReplayOptions(),
+                                            lambda progress: print_progress_bar(int(progress * 100), 100,
+                                                                                "Opening capture:"))
 
-    if status != rd.ReplayStatus.Succeeded:
+    if status != rd.ResultCode.Succeeded:
         raise RuntimeError(f"Couldn't open {remote_rdc_path} on remote, got error {str(status)}")
 
     return controller
@@ -146,15 +167,17 @@ def get_local_controller(rdc_path: str):
     cap = rd.OpenCaptureFile()
     status = cap.OpenFile(rdc_path, '', None)
 
-    if status != rd.ReplayStatus.Succeeded:
+    if status != rd.ResultCode.Succeeded:
         raise RuntimeError("Couldn't open file: " + str(status))
 
     if not cap.LocalReplaySupport():
         raise RuntimeError("Capture cannot be replayed")
 
-    status, controller = cap.OpenCapture(rd.ReplayOptions(), None)
+    status, controller = cap.OpenCapture(rd.ReplayOptions(),
+                                         lambda progress: print_progress_bar(int(progress * 100), 100,
+                                                                             "Opening capture:"))
 
-    if status != rd.ReplayStatus.Succeeded:
+    if status != rd.ResultCode.Succeeded:
         raise RuntimeError("Couldn't initialise replay: " + str(status))
 
     return controller
